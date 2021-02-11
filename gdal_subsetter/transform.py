@@ -168,9 +168,9 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
             layernames.append(layer.layer_id)
         else:
-            variables = source.process('variables')
-
-            for variable in variables:
+            variables = self.get_variables(input_filename)
+            
+            for variable in source.process('variables'):
                 band = None
 
                 index = next(
