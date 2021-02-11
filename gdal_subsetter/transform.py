@@ -4,7 +4,6 @@
 If you have harmony in a peer folder with this repo, then you can run the following for an example
 python3 -m harmony_gdal --harmony-action invoke --harmony-input "$(cat ../harmony/example/service-operation.json)"
 """
-
 import os
 import subprocess
 import re
@@ -24,7 +23,6 @@ from shapely.ops import cascaded_union
 import pyproj
 from osgeo import gdal, osr, ogr, gdal_array
 from netCDF4 import Dataset
-import pystac
 import pystac
 import numpy as np
 import geopandas as gpd
@@ -169,7 +167,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             layernames.append(layer.layer_id)
         else:
             variables = self.get_variables(input_filename)
-            
+
             for variable in source.process('variables'):
                 band = None
 
