@@ -289,7 +289,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         dataset = gdal.Open(srcfile)
         gt = dataset.GetGeoTransform()
 
-        return gt[2] != 0.0 or gt[4] != 0:
+        return gt[2] != 0.0 or gt[4] != 0
 
     def nc2tiff(self, layerid, filename, dstdir):
         def search(myDict, lookupkey):
