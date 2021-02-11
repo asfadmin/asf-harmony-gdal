@@ -16,8 +16,7 @@ from affine import Affine
 import glob
 import json
 
-from harmony import BaseHarmonyAdapter, util
-from harmony.util import stage, bbox_to_geometry, download, generate_output_filename
+from harmony import BaseHarmonyAdapter, util as harmony_util
 
 import shapely
 from shapely.geometry import shape, mapping, Point, MultiPoint, LineString, Polygon
@@ -25,53 +24,15 @@ from shapely.ops import cascaded_union
 import pyproj
 from osgeo import gdal, osr, ogr, gdal_array
 from netCDF4 import Dataset
-from pystac import Asset
+import pystac
+import pystac
 import numpy as np
 import geopandas as gpd
 import fiona
 
-
-mime_to_gdal = {
-    "image/tiff": "GTiff",
-    "image/png": "PNG",
-    "image/gif": "GIF",
-    "application/x-netcdf4": "NETCDF"
-}
-
-mime_to_extension = {
-    "image/tiff": "tif",
-    "image/png": "png",
-    "image/gif": "gif",
-    "application/x-netcdf4": "nc"
-}
-
-mime_to_options = {
-    "image/tiff": ["-co", "COMPRESS=LZW"]
-}
-
-
-class ObjectView(object):
-    """
-    Simple class to make a dict look like an object.
-
-    Example
-    --------
-        >>> o = ObjectView({ "key": "value" })
-        >>> o.key
-        'value'
-    """
-
-    def __init__(self, d):
-        """
-        Allows accessing the keys of dictionary d as though they
-        are properties on an object
-
-        Parameters
-        ----------
-        d : dict
-            a dictionary whose keys we want to access as object properties
-        """
-        self.__dict__ = d
+import mime
+from layer import Layer
+from object_view import ObjectView
 
 
 class HarmonyAdapter(BaseHarmonyAdapter):
@@ -121,71 +82,69 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         stac_record.assets = {}
 
         output_dir = mkdtemp()
+
         try:
             # Get the data file
             asset = next(v for k, v in item.assets.items()
                          if 'data' in (v.roles or []))
 
-            if self.config.fallback_authn_enabled:
-                input_filename = download(
-                    asset.href,
-                    output_dir,
-                    logger=self.logger,
-                    access_token=None,
-                    cfg=self.config)
-            else:
-                input_filename = download(
-                    asset.href,
-                    output_dir,
-                    logger=self.logger,
-                    access_token=self.message.accessToken,
-                    cfg=self.config)
+            access_token = None if self.config.fallback_authn_enabled else self.message.accessToken
+
+            input_filename = harmony_util.download(
+                asset.href,
+                output_dir,
+                logger=self.logger,
+                access_token=access_token,
+                cfg=self.config
+            )
 
             basename = os.path.splitext(os.path.basename(
-                generate_output_filename(asset.href, **operations))
+                harmony_util.generate_output_filename(asset.href, **operations))
             )[0]
 
             file_type = self.get_filetype(input_filename)
 
             if file_type is None:
                 return item
-            elif file_type == 'tif':
-                layernames, filename = self.process_geotiff(
-                    source, basename, input_filename, output_dir, layernames
-                )
-            elif file_type == 'nc':
-                layernames, filename = self.process_netcdf(
-                    source, basename, input_filename, output_dir, layernames
-                )
-            elif file_type == 'zip':
-                layernames, filename = self.process_zip(
-                    source, basename, input_filename, output_dir, layernames
-                )
-            else:
-                self.completed_with_error(
+
+            process_func = {
+                'tif': self.process_geotiff,
+                'nc': self.process_netcdf,
+                'zip': self.process_zip
+            }.get(file_type, None)
+
+            if process is None:
+                return self.completed_with_error(
                     'No recognized file foarmat, not process'
                 )
+
+            layernames, filename = process_func(
+                source, basename, input_filename, output_dir, layernames
+            )
 
             self.update_layernames(filename, [v for v in layernames])
 
             # Update metadata with bbox and extent in lon/lat coordinates for the geotiff file
             # Also update the STAC record
             stac_record.bbox = self.get_bbox_lonlat(filename)
-            stac_record.geometry = bbox_to_geometry(stac_record.bbox)
+            stac_record.geometry = harmony_util.bbox_to_geometry(
+                stac_record.bbox)
 
             # Filename may change into the format other than geotiff
             filename = self.reformat(filename, output_dir)
             output_filename = basename + os.path.splitext(filename)[-1]
             mime = message.format.mime
-            url = stage(
+
+            url = harmony_util.stage(
                 filename,
                 output_filename,
                 mime,
                 location=message.stagingLocation,
                 logger=logger,
-                cfg=self.config)
+                cfg=self.config
+            )
 
-            stac_record.assets['data'] = Asset(
+            stac_record.assets['data'] = pystac.Asset(
                 url, title=output_filename, media_type=mime, roles=['data']
             )
 
@@ -197,47 +156,50 @@ class HarmonyAdapter(BaseHarmonyAdapter):
     def process_geotiff(self, source, basename, input_filename, output_dir, layernames):
         if not source.variables:
             # process geotiff and all bands
-
-            filename = input_filename
-            layer_id = basename + '__all'
             band = None
-            layer_id, filename, output_dir = self.combin_transfer(
-                layer_id, filename, output_dir, band)
-            result = self.rename_to_result(
-                layer_id, filename, output_dir)
-            layernames.append(layer_id)
+            layer = Layer(
+                f'{basename}__all',
+                input_filename,
+                output_dir
+            )
+
+            layer = self.combin_transfer(layer, band)
+            result = self.rename_to_result(layer)
+
+            layernames.append(layer.layer_id)
         else:
             variables = source.process('variables')
 
             for variable in variables:
-
                 band = None
 
-                index = next(i for i, v in enumerate(
-                    variables) if v.name.lower() == variable.name.lower())
+                index = next(
+                    i for i, v in enumerate(variables)
+                    if v.name.lower() == variable.name.lower()
+                )
+
                 if index is None:
-                    return self.completed_with_error('band not found: ' + variable)
+                    return self.completed_with_error('band not found: {variable}')
+
                 band = index + 1
 
-                filename = input_filename
-
-                layer_id = basename + '__' + variable.name
-
-                layer_id, filename, output_dir = self.combin_transfer(
-                    layer_id, filename, output_dir, band)
-
-                result = self.add_to_result(
-                    layer_id,
-                    filename,
+                layer = Layer(
+                    f'{basename}__{variable.name}',
+                    input_filename,
                     output_dir
                 )
-                layernames.append(layer_id)
+
+                layer = self.combin_transfer(layer, band)
+
+                result = self.add_to_result(layer)
+
+                layernames.append(layer.layer_id)
 
         return layernames, result
 
     def process_netcdf(self, source, basename, input_filename, output_dir, layernames):
-        variables = source.process(
-            'variables') or self.get_variables(input_filename)
+        variables = source.process('variables') or \
+            self.get_variables(input_filename)
 
         for variable in variables:
             band = None
@@ -249,22 +211,23 @@ class HarmonyAdapter(BaseHarmonyAdapter):
                 variable.name
             )
             filename = layer_format.format(
-                input_filename)
-
-            layer_id = basename + '__' + variable.name
+                input_filename
+            )
 
             # convert the subdataset in the nc file into the geotif file
             filename = self.nc2tiff(layer_id, filename, output_dir)
 
-            layer_id, filename, output_dir = self.combin_transfer(
-                layer_id, filename, output_dir, band)
-
-            result = self.add_to_result(
-                layer_id,
+            layer = Layer(
+                f'{basename}__{variable.name}',
                 filename,
                 output_dir
             )
-            layernames.append(layer_id)
+
+            layer = self.combin_transfer(layer, band)
+
+            result = self.add_to_result(layer)
+
+            layernames.append(layer.layer_id)
 
         return layernames, result
 
@@ -273,11 +236,13 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         if tiffile:
             layernames, result = self.process_geotiff(
-                source, basename, tiffile, output_dir, layernames)
+                source, basename, tiffile, output_dir, layernames
+            )
 
         if ncfile:
             layernames, result = self.process_netcdf(
-                source, basename, ncfile, output_dir, layernames)
+                source, basename, ncfile, output_dir, layernames
+            )
 
         return layernames, result
 
@@ -323,22 +288,17 @@ class HarmonyAdapter(BaseHarmonyAdapter):
     def is_rotated_geotransform(self, srcfile):
         dataset = gdal.Open(srcfile)
         gt = dataset.GetGeoTransform()
-        check = False
 
-        if gt[2] != 0.0 or gt[4] != 0:
-            check = True
-
-        return check
+        return gt[2] != 0.0 or gt[4] != 0:
 
     def nc2tiff(self, layerid, filename, dstdir):
-
         def search(myDict, lookupkey):
             for key, value in myDict.items():
                 if lookupkey in key:
                     return myDict[key]
 
         normalized_layerid = layerid.replace('/', '_')
-        dstfile = "%s/%s" % (dstdir, normalized_layerid + '__nc2tiff.tif')
+        dstfile = f"{dstdir}/{normalized_layerid}__nc2tiff.tif"
         ds = gdal.Open(filename)
         metadata = ds.GetMetadata()
         crs_wkt = search(metadata, "crs_wkt")
@@ -348,6 +308,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             command.extend([crs_wkt])
             command.extend([filename, dstfile])
             self.cmd(*command)
+
             return dstfile
 
         return filename
@@ -357,7 +318,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             return srcfile
 
         command = ['gdal_translate']
-        command.extend(['-b', '%s' % (band)])
+        command.extend(['-b', f'{band}'])
         command.extend([srcfile, dstfile])
         self.cmd(*command)
 
@@ -368,11 +329,9 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         subset = self.message.subset
 
         if subset.bbox is None and subset.shape is None:
-            dstfile = "%s/%s" % (dstdir, normalized_layerid +
-                                 '__varsubsetted.tif')
-            dstfile = self.varsubset(srcfile, dstfile, band=band)
+            dstfile = f"{dstdir}/{normalized_layerid}__varsubsetted.tif"
 
-            return dstfile
+            return self.varsubset(srcfile, dstfile, band=band)
 
         if subset.bbox:
             [left, bottom, right, top] = self.get_bbox(srcfile)
@@ -381,35 +340,38 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             subsetbbox = subset.process('bbox')
 
             [b0, b1], transform = self.lonlat2projcoord(
-                srcfile, subsetbbox[0], subsetbbox[1])
+                srcfile, subsetbbox[0], subsetbbox[1]
+            )
+
             [b2, b3], transform = self.lonlat2projcoord(
-                srcfile, subsetbbox[2], subsetbbox[3])
+                srcfile, subsetbbox[2], subsetbbox[3]
+            )
 
             if any(x is None for x in [b0, b1, b2, b3]):
-                dstfile = "%s/%s" % (dstdir,
-                                     normalized_layerid + '__varsubsetted.tif')
+                dstfile = "{dstdir}/{normalized_layerid}__varsubsetted.tif"
                 dstfile = self.varsubset(srcfile, dstfile, band=band)
+
             elif b0 < left and b1 < bottom and b2 > right and b3 > top:
                 # user's input subset totally covers the image bbox, do not do subset
-                dstfile = "%s/%s" % (dstdir,
-                                     normalized_layerid + '__varsubsetted.tif')
+                dstfile = "{dstdir}/{normalized_layerid}__varsubsetted.tif"
                 dstfile = self.varsubset(srcfile, dstfile, band=band)
             else:
-                dstfile = "%s/%s" % (dstdir,
-                                     normalized_layerid + '__subsetted.tif')
+                dstfile = "{dstdir}/{normalized_layerid}__subsetted.tif"
                 dstfile = self.subset2(
-                    srcfile, dstfile, bbox=subsetbbox, band=band)
+                    srcfile, dstfile, bbox=subsetbbox, band=band
+                )
 
             return dstfile
 
         if subset.shape:
             # need know what the subset.shape is. Is it a file? do we need pre-process like we did for subset.bbox?
-            dstfile = "%s/%s" % (dstdir,
-                                 normalized_layerid + '__subsetted.tif')
+            dstfile = "{dstdir}/{normalized_layerid}__subsetted.tif"
+
             # get the shapefile
             shapefile = self.get_shapefile(subset.shape, dstdir)
             dstfile = self.subset2(
-                srcfile, dstfile, shapefile=shapefile, band=band)
+                srcfile, dstfile, shapefile=shapefile, band=band
+            )
 
             return dstfile
 
@@ -480,14 +442,14 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         """
         href = subsetshape.href
         filetype = subsetshape.type
-        shapefile = util.download(href, dstdir)
+        shapefile = harmony_util.download(href, dstdir)
 
         # get unit of the feature in the shapefile
         unit = self.get_coord_unit(shapefile)
 
         # convert into multi-polygon feature file
         fileprex = os.path.splitext(shapefile)[0]
-        tmpfile_geojson = fileprex+"_tmp.geojson"
+        tmpfile_geojson = f"{fileprex}_tmp.geojson"
 
         # check BUFFER environment to get buf from message passed by harmony
         buffer_string = os.environ.get('BUFFER')
@@ -495,10 +457,8 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             buffer_dic = eval(buffer_string)
 
             if unit:
-                if "degree" in unit.lower():
-                    buf = buffer_dic["degree"]
-                else:
-                    buf = buffer_dic["meter"]
+                key = "degree" if "degree" in unit.lower() else "meter"
+                buf = buffer_dic[key]
             else:
                 buf = None
         else:
@@ -506,10 +466,11 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         # convert to a new multipolygon file
         tmpfile_geojson = self.convert2multipolygon(
-            shapefile, tmpfile_geojson, buf=buf)
+            shapefile, tmpfile_geojson, buf=buf
+        )
 
         # convert into ESRI shapefile
-        outfile = fileprex+".shp"
+        outfile = f"{fileprex}.shp"
         command = ['ogr2ogr', '-f', 'ESRI Shapefile']
         command.extend([outfile, tmpfile_geojson])
         self.cmd(*command)
@@ -523,7 +484,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             return srcfile
 
         normalized_layerid = layerid.replace('/', '_')
-        dstfile = "%s/%s" % (dstdir, normalized_layerid + '__reprojected.tif')
+        dstfile = "{dstdir}/{normalized_layerid}__reprojected.tif"
         self.cmd('gdalwarp', "-t_srs", crs, srcfile, dstfile)
 
         return dstfile
@@ -532,7 +493,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         command = ['gdal_translate']
         fmt = self.message.format
         normalized_layerid = layerid.replace('/', '_')
-        dstfile = "%s/%s__resized.tif" % (dstdir, normalized_layerid)
+        dstfile = "{dstdir}/{normalized_layerid}__resized.tif"
 
         if fmt.width or fmt.height:
             width = fmt.process('width') or 0
@@ -544,19 +505,21 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         return dstfile
 
-    def add_to_result(self, layerid, srcfile, dstdir):
-        tmpfile = "%s/tmp-result.tif" % (dstdir)
-        dstfile = "%s/result.tif" % (dstdir)
+    def add_to_result(self, layer):
+        temp_file = f'{layer.output_dir}/tmp-result.tif'
+        output_file = f'{layer.output_dir}/result.tif'
 
-        if not os.path.exists(dstfile):
-            self.cmd('cp', srcfile, dstfile)
-            return dstfile
+        if not os.path.exists(output_file):
+            self.cmd('cp', layer.filename, output_file)
+        else:
+            temp_file = self.stack_multi_file_with_metadata(
+                [output_file, layer.filename],
+                temp_file
+            )
 
-        tmpfile = self.stack_multi_file_with_metadata(
-            [dstfile, srcfile], tmpfile)
-        self.cmd('mv', tmpfile, dstfile)
+            self.cmd('mv', temp_file, output_file)
 
-        return dstfile
+        return output_file
 
     def stack_multi_file_with_metadata(self, infilelist, outfile):
         """
@@ -591,13 +554,13 @@ class HarmonyAdapter(BaseHarmonyAdapter):
                 bmd.update(md)
                 data = band.ReadAsArray()
                 count = count+1
-                band_name = "Band{count}:{filestr}-{i}".format(
-                    count=count, filestr=filestr, i=i)
+                band_name = f"Band{count}:{filestr}-{i}"
                 tmp_bmd = {"bandname": band_name}
                 bmd.update(tmp_bmd)
                 ds_description.append(band_name)
                 collection.append(
-                    {"band_sn": count, "band_md": bmd, "band_array": data})
+                    {"band_sn": count, "band_md": bmd, "band_array": data}
+                )
 
         dst_ds = gdal.GetDriverByName('GTiff').Create(
             outfile, cols, rows, count, gtyp
@@ -610,41 +573,42 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             dst_ds.GetRasterBand(i+1).WriteArray(collection[i]["band_array"])
             dst_ds.GetRasterBand(i+1).SetMetadata(collection[i]["band_md"])
 
-        dst_ds.FlushCache()                     # write to disk
+        # write to disk
+        dst_ds.FlushCache()
         dst_ds = None
 
         return outfile
 
-    def rename_to_result(self, layerid, srcfile, dstdir):
-        dstfile = "%s/result.tif" % (dstdir)
+    def rename_to_result(self, layer):
+        output_file = f"{layer.output_dir}/result.tif"
 
-        if not os.path.exists(dstfile):
-            self.cmd('mv', srcfile, dstfile)
+        if not os.path.exists(output_file):
+            self.cmd('mv', layer.filename, output_file)
 
-        return dstfile
+        return output_file
 
     def reformat(self, srcfile, dstdir):
-        gdal_subsetter_version = "gdal_subsetter_version={gdal_subsetter_ver}".format(
-            gdal_subsetter_ver=self.get_version())
+        gdal_subsetter_version = f"gdal_subsetter_version={self.get_version()}"
 
-        command = ['gdal_edit.py',  '-mo', gdal_subsetter_version, srcfile]
+        command = ['gdal_edit.py', '-mo', gdal_subsetter_version, srcfile]
         self.cmd(*command)
 
         output_mime = self.message.format.process('mime')
 
-        if output_mime not in mime_to_gdal:
+        if output_mime not in mime.GDAL:
             raise Exception('Unrecognized output format: ' + output_mime)
 
         if output_mime == "image/tiff":
             return srcfile
 
-        dstfile = "%s/translated.%s" % (dstdir, mime_to_extension[output_mime])
+        extension = mime.EXTENSION[output_mime]
+        dstfile = f"{dstdir}/translated.{extension}"
 
         if output_mime == "application/x-netcdf4":
             dstfile = self.geotiff2netcdf(srcfile, dstfile)
         else:
             command = ['gdal_translate',
-                       '-of', mime_to_gdal[output_mime],
+                       '-of', mime.GDAL[output_mime],
                        '-scale',
                        srcfile, dstfile]
             self.cmd(*command)
@@ -656,7 +620,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         layer_line = next(
             filter(
-                (lambda line: re.search(":*" + layer_id+"$", line)),
+                (lambda line: re.search(":*" + layer_id + "$", line)),
                 gdalinfo_lines
             ),
             None
@@ -675,16 +639,16 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         # Normal case of NetCDF / HDF, where variables are subdatasets
         for subdataset in filter((lambda line: re.match(r"^\s*SUBDATASET_\d+_NAME=", line)), gdalinfo_lines):
-            result.append(ObjectView({"name": re.split(r":", subdataset)[-1]}))
+            obj = ObjectView({"name": re.split(r":", subdataset)[-1]})
+            result.append(obj)
 
         if result:
             return result
 
         # GeoTIFFs, where variables are bands, with descriptions set to their variable name
         for subdataset in filter((lambda line: re.match(r"^\s*Description = ", line)), gdalinfo_lines):
-            result.append(ObjectView(
-                {"name": re.split(r" = ", subdataset)[-1]}
-            ))
+            obj = ObjectView({"name": re.split(r" = ", subdataset)[-1]})
+            result.append(obj)
 
         if result:
             return result
@@ -692,8 +656,8 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         # Some GeoTIFFdoes not have descriptions. directly use Band # as the variables
         for subdataset in filter((lambda line: re.match(r"^Band", line)), gdalinfo_lines):
             tmpline = re.split(r" ", subdataset)
-            result.append(ObjectView(
-                {"name": tmpline[0].strip()+tmpline[1].strip(), }))
+            obj = ObjectView({"name": tmpline[0].strip()+tmpline[1].strip()})
+            result.append(obj)
 
         if result:
             return result
@@ -721,24 +685,25 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         return gdalinfo_lines[0] == "Driver: GTiff/GeoTIFF"
 
-    def combin_transfer(self, layer_id, filename, output_dir, band):
-        filename = self.subset(
-            layer_id,
-            filename,
-            output_dir,
+    def combin_transfer(self, layer, band):
+        layer.filename = self.subset(
+            layer.layer_id,
+            layer.filename,
+            layer.output_dir,
             band
         )
-        filename = self.reproject(
-            layer_id,
-            filename,
-            output_dir
+        layer.filename = self.reproject(
+            layer.layer_id,
+            layer.filename,
+            layer.output_dir
         )
-        filename = self.resize(
-            layer_id,
-            filename,
-            output_dir
+        layer.filename = self.resize(
+            layer.layer_id,
+            layer.filename,
+            layer.output_dir
         )
-        return layer_id, filename, output_dir
+
+        return layer
 
     def get_bbox(self, filename):
         """
@@ -812,12 +777,13 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
     def pack_zipfile(self, zipfilename, output_dir, variables=None):
         with zipfile.ZipFile(zipfilename, 'r') as zip_ref:
-            zip_ref.extractall(output_dir+'/unzip')
+            zip_ref.extractall(f"{output_dir}/unzip")
 
         tmptif = None
 
         filelist_tif = self.get_file_from_unzipfiles(
-            f'{output_dir}/unzip', 'tif', variables)
+            f'{output_dir}/unzip', 'tif', variables
+        )
 
         if filelist_tif:
             tmpfile = f'{output_dir}/tmpfile'
@@ -901,38 +867,41 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         if bbox:
             boxproj, proj = self.boxwrs84_boxproj(bbox, ref_ds)
             ul_x, ul_y, ul_i, ul_j, cols, rows = self.calc_subset_envelopwindow(
-                ref_ds, boxproj)
+                ref_ds, boxproj
+            )
             command = ['gdal_translate']
 
             if band:
                 command.extend(['-b', '%s' % (band)])
             command.extend(
-                ['-srcwin', str(ul_i), str(ul_j), str(cols), str(rows)])
+                ['-srcwin', str(ul_i), str(ul_j), str(cols), str(rows)]
+            )
             command.extend([tiffile, tmpfile])
             self.cmd(*command)
 
             # for rotated image, need extra process
             if gt[2] != 0.0 or gt[4] != 0.0:
-                # create shapefile_out with box
                 shapefile_out = self.box2shapefile(tiffile, bbox)
-                #self.rasterize(tmpfile, shapefile_out, outputfile)
-                self.mask_via_shapefile2(tmpfile, shapefile_out, outputfile)
+                self.mask_via_shapefile(tmpfile, shapefile_out, outputfile)
             else:
                 self.cmd(*['cp', tmpfile, outputfile])
 
         elif shapefile:
             shapefile_out = f'{os.path.dirname(outputfile)}/tmpshapefile'
             boxproj, proj, shapefile_out, geometryname = self.shapefile_boxproj(
-                shapefile, ref_ds, shapefile_out)
+                shapefile, ref_ds, shapefile_out
+            )
             ul_x, ul_y, ul_i, ul_j, cols, rows = self.calc_subset_envelopwindow(
-                ref_ds, boxproj, delt=10)
+                ref_ds, boxproj, delt=10
+            )
             command = ['gdal_translate']
 
             if band:
-                command.extend(['-b', '%s' % (band)])
+                command.extend(['-b', f'{band}'])
 
             command.extend(
-                ['-srcwin', str(ul_i), str(ul_j), str(cols), str(rows)])
+                ['-srcwin', str(ul_i), str(ul_j), str(cols), str(rows)]
+            )
             command.extend([tiffile, tmpfile])
             self.cmd(*command)
 
@@ -1070,7 +1039,8 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         outDataSource = outDriver.CreateDataSource(shapefile)
         outSpatialRef = osr.SpatialReference(projection)
         outLayer = outDataSource.CreateLayer(
-            'boundingbox', outSpatialRef, geom_type=ogr.wkbPolygon)
+            'boundingbox', outSpatialRef, geom_type=ogr.wkbPolygon
+        )
         featureDefn = outLayer.GetLayerDefn()
 
         # add new geom to layer
@@ -1241,80 +1211,9 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         return: outputfile is masked geotiff file
         """
 
-        tmpfilepre = inputfile.split(".")[0]
-        tmpfile = f"{tmpfilepre}-tmp.tif"
-
-        # copy inputfile to tmpfile
-        self.cmd(*['cp', '-f', inputfile, tmpfile])
-
-        # get the infomation of inputfile
-        ds = gdal.Open(inputfile)
-        num = ds.RasterCount
-        tmpfilelst = []
-
-        # read shapefile info
-        shp = ogr.Open(shapefile)
-        ly = shp.GetLayerByIndex(0)
-        lyname = ly.GetName()
-
-        for i in range(num):
-            band_sn = i+1
-            band = ds.GetRasterBand(band_sn)
-            nodata = band.GetNoDataValue()
-            dtyp = gdal.GetDataTypeName(band.DataType)
-
-            if dtyp == 'Byte':
-                burnval = 0
-            else:
-                burnval = 0.0
-
-            # rasterize
-            command = ['gdal_rasterize']
-            command.extend(["-b", f"{band_sn}"])
-            command.extend(["-burn", f"{burnval}"])
-            command.extend(['-l', lyname, shapefile])
-            command.extend([tmpfile])
-            self.cmd(*command)
-
-            # calc
-            command = ['gdal_calc.py']
-            command.extend(
-                ["-A", f"{inputfile}", f"--A_band={band_sn}"])
-            command.extend(
-                ["-B", "{b}".format(b=tmpfile), "--B_band={band_sn}".format(band_sn=band_sn)])
-            command.extend(['--calc="A-B"'])
-            command.extend(['--overwrite'])
-            tmpbandfile = "{tmpfilepre}band{band_sn}.tif".format(
-                tmpfilepre=tmpfilepre, band_sn=band_sn)
-            command.extend(
-                ["--outfile={tmpbandfile}".format(tmpbandfile=tmpbandfile)])
-
-            cmdline = " ".join(command)
-            os.system(cmdline)
-            tmpfilelst.append(tmpbandfile)
-
-            # copy metadata
-            self.transfer_metadata(tmpfile, band_sn, tmpbandfile, 1)
-
-        # combine tmpbandfile to one outputfile
-        if os.path.exists(outputfile):
-            self.cmd(*['rm', '-f', outputfile])
-
-        self.stack_multi_file_with_metadata(tmpfilelst, outputfile)
-
-        return outputfile
-
-    def mask_via_shapefile2(self, inputfile, shapefile, outputfile):
-        """
-        It sets the pixles of the inputfile outside the bbox as a nodata value.
-        inputs: inputfile is geotiff file
-                bbox-[minx,miny,maxx,maxy] in lon/lat coorninates.
-        return: outputfile is masked geotiff file
-        """
-
         # define temorary file name
         tmpfilepre = os.path.splitext(inputfile)[0]
-        tmpfile = "{tmpfilepre}-tmp.tif".format(tmpfilepre=tmpfilepre)
+        tmpfile = f"{tmpfilepre}-tmp.tif"
 
         # copy inputfile to tmpfile
         self.cmd(*['cp', '-f', inputfile, tmpfile])
@@ -1333,7 +1232,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         num = msk_ds.RasterCount
 
         for i in range(num):
-            band_sn = i+1
+            band_sn = i + 1
             msk_band = msk_ds.GetRasterBand(band_sn)
             msk_data = msk_band.ReadAsArray()
             gdal_dt = gdal.GetDataTypeName(msk_band.DataType)
@@ -1422,9 +1321,9 @@ class HarmonyAdapter(BaseHarmonyAdapter):
                 rmvar_lst.append(varname)
 
             # add the metedata in geotiff to the related variables
-            varlst = [x for x in md if bool(
-                re.search(f"/{varname}*", x)
-            )]
+            varlst = [
+                x for x in md if bool(re.search(f"/{varname}*", x))
+            ]
 
             for x in varlst:
                 attrname = x.split("#")[-1]
@@ -1447,46 +1346,5 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         command.extend([tmpfile, outfile])
         self.cmd(*command)
-
-        return outfile
-
-    def geotiff2netcdf2(self, infile, outfile):
-        '''
-        convert geotiff file to netcdf file via gdal_warp method. This way reprojects the infile
-        if it is rotated image.
-        input: infile - geotiff file name
-        return: outfile - netcdft file name
-        '''
-        command = ['gdalwarp']
-        command.extend(['-of', 'NETCDF', '-overwrite'])
-        command.extend([infile, outfile])
-        self.cmd(*command)
-
-        # add the metedata obtained from infile to nc file
-        ds_in = gdal.Open(infile)
-
-        # get crs defined in metadata
-        md = ds_in.GetMetadata()
-
-        # open outfile for update
-        ds_out = Dataset(outfile, 'a')
-
-        # convert metadata to variable atttrs
-        varnames = ds_out.variables.keys()
-
-        for varname in varnames:
-            varlst = [
-                x for x in md if bool(re.search(f"/{varname}*", x))
-            ]
-            var = ds_out.variables[varname]
-
-            for x in varlst:
-                attrname = x.split("#")[-1]
-                if not attrname in var.ncattrs():
-                    if attrname != '_FillValue':
-                        var.setncattr(attrname, md[x])
-
-        ds_in = None
-        ds_out.close()
 
         return outfile
