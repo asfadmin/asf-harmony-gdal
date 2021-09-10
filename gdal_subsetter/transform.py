@@ -15,8 +15,11 @@ import shutil
 from affine import Affine
 import glob
 import json
+import argparse
+import time
 
-from harmony import BaseHarmonyAdapter, util
+import harmony
+from harmony.adapter import BaseHarmonyAdapter, util
 from harmony.util import stage, bbox_to_geometry, download, generate_output_filename
 
 import shapely
@@ -417,12 +420,15 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             ds = gdal.Open(filename)
             metadata = ds.GetMetadata()
             crs_wkt = search(metadata, "crs_wkt")
-            if crs_wkt:
-                command = ['gdal_translate', '-a_srs']
-                command.extend([crs_wkt])
-                command.extend([filename, dstfile])
-                self.cmd(*command)
-                return dstfile
+
+            if crs_wkt is None:
+                crs_wkt = 'EPSG:4326'
+            command = ['gdal_translate', '-a_srs']
+            command.extend([crs_wkt])
+            command.extend([filename, dstfile])
+            self.cmd(*command)
+
+            return dstfile
         except:
             return None
 
@@ -596,6 +602,10 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         normalized_layerid = layerid.replace('/', '_')
         dstfile = "%s/%s__resized.tif" % (dstdir, normalized_layerid)
 
+        if self.message.format.mime == 'image/png':
+            # need to unscale values to color PNGs correctly
+            command.extend(['-unscale', '-ot', 'Float64'])
+
         if fmt.width or fmt.height:
             width = fmt.process('width') or 0
             height = fmt.process('height') or 0
@@ -648,9 +658,60 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         dstfile = _regrid(srcfile, dstfile, resampling_mode=resample_method, ref_crs =crs, ref_box=box, ref_xres=xres, ref_yres=yres)
         return dstfile
-    
+
+    def recolor(self, layerid, srcfile, dstdir):
+        fmt = self.message.format
+        # colormap = fmt.colormap
+
+        # Use hard coded colormaps that match layerid
+        colormaps_dir = os.path.dirname(os.path.realpath(__file__)) + '/colormaps/'
+        if 'ECCO' in layerid:
+            colormap = colormaps_dir + 'MedspirationIndexed.txt'
+            discrete = True
+        elif 'MUR' in layerid:
+            colormap = colormaps_dir + 'SST.txt'
+            discrete = True
+        else:
+            colormap = colormaps_dir + 'Gray.txt'
+            discrete = False
+
+        if colormap:
+            normalized_layerid = layerid.replace('/', '_')
+            dstfile = "%s/%s" % (dstdir, normalized_layerid + '__colored')
+            command = [
+                'gdaldem',
+                'color-relief',
+                '-alpha',
+            ]
+            if discrete:
+                command.extend(['-nearest_color_entry'])
+            if 'png' in fmt.mime:
+                command.extend(['-of', 'PNG', '-co', 'WORLDFILE=YES'])
+                dstfile += '.png'
+            elif 'jpeg' in fmt.mime:
+                command.extend(['-of', 'JPEG', '-co', 'WORLDFILE=YES'])
+                dstfile += '.jpeg'
+            else:
+                dstfile += '.tif'
+            command.extend([srcfile, colormap, dstfile])
+            self.cmd(*command)
+            if 'png' in fmt.mime or 'jpeg' in fmt.mime:
+                shutil.copyfile(dstfile, "%s/%s%s" % (dstdir, 'result', os.path.splitext(dstfile)[1]))
+                shutil.copyfile(os.path.splitext(dstfile)[0] + '.wld', "%s/%s" % (dstdir, 'result.wld'))
+            return dstfile
+        else:
+            return srcfile
+
     def add_to_result(self, filelist, dstdir):
-        dstfile = "%s/result.tif" % (dstdir)
+        dstfile = "%s/result" % (dstdir)
+        if 'png' in self.message.format.mime:
+            dstfile += '.png'
+            return(dstfile)
+        elif 'jpeg' in self.message.format.mime:
+            dstfile += '.jpeg'
+            return(dstfile)
+        else:
+            dstfile += '.tif'
         if filelist and self.checkstackable(filelist):
             return self.stack_multi_file_with_metadata(filelist, dstfile)
         else:
@@ -859,6 +920,11 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             filename,
             output_dir
         )
+        filename = self.recolor(
+            layer_id,
+            filename,
+            output_dir
+        )
 
         
         return layer_id, filename, output_dir
@@ -936,6 +1002,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         dtypelst=[]
         xsizelst=[]
         ysizelst=[]
+        formatlst=[]
 
         for item in filelist:
             ds = gdal.Open(item)
@@ -944,6 +1011,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             dtypelst.append("{dtype}".format( dtype = ds.GetRasterBand(1).DataType))
             xsizelst.append("{xsize}".format( xsize = ds.RasterXSize))
             ysizelst.append("{ysize}".format( ysize = ds.RasterYSize))
+            formatlst.append(os.path.splitext(item)[1])
 
 
         result_proj = False
@@ -966,7 +1034,11 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         if len(ysizelst) > 0 :
             result_ysize = all(elem == ysizelst[0] for elem in ysizelst)
 
-        if result_proj and result_gt and result_dtype and result_xsize and result_ysize:
+        result_format = True
+        if '.png' in formatlst:
+            result_format = False
+
+        if result_proj and result_gt and result_dtype and result_xsize and result_ysize and result_format:
 
             return True
         else:
@@ -1652,3 +1724,31 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         dst.close
         return outfile
 
+
+def main():
+    """
+    Parses command line arguments and invokes the appropriate method to respond to them
+
+    Returns
+    -------
+    None
+    """
+
+    parser = argparse.ArgumentParser(
+        prog='harmony-gdal', description='Run the GDAL service'
+    )
+
+    harmony.setup_cli(parser)
+    args = parser.parse_args()
+
+    if (harmony.is_harmony_cli(args)):
+        harmony.run_cli(parser, args, HarmonyAdapter)
+    else:
+        parser.error("Only --harmony CLIs are supported")
+
+
+if __name__ == "__main__":
+    #os.environ["FALLBACK_AUTHN_ENABLED"] = 'true'
+    os.environ["BUFFER"] = '{"degree":0.0001, "meter":10.0}'
+
+    main()
