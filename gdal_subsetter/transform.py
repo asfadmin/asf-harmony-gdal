@@ -661,6 +661,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
     def recolor(self, layerid, srcfile, dstdir):
         fmt = self.message.format
+        dstfile = srcfile  # passthrough if no colormap
         # colormap = fmt.colormap
 
         # Use hard coded colormaps that match layerid
@@ -698,25 +699,23 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             if 'png' in fmt.mime or 'jpeg' in fmt.mime:
                 shutil.copyfile(dstfile, "%s/%s%s" % (dstdir, 'result', os.path.splitext(dstfile)[1]))
                 shutil.copyfile(os.path.splitext(dstfile)[0] + '.wld', "%s/%s" % (dstdir, 'result.wld'))
-            return dstfile
-        else:
-            return srcfile
+
+        return dstfile
 
     def add_to_result(self, filelist, dstdir):
         dstfile = "%s/result" % (dstdir)
+        output = None
         if 'png' in self.message.format.mime:
             dstfile += '.png'
-            return(dstfile)
+            output = dstfile
         elif 'jpeg' in self.message.format.mime:
             dstfile += '.jpeg'
-            return(dstfile)
+            output = dstfile
         else:
             dstfile += '.tif'
-        if filelist and self.checkstackable(filelist):
-            return self.stack_multi_file_with_metadata(filelist, dstfile)
-        else:
-            return None
-
+            if filelist and self.checkstackable(filelist):
+                output = self.stack_multi_file_with_metadata(filelist, dstfile)
+        return output
 
     def stack_multi_file_with_metadata(self, infilelist, outfile):
         '''
@@ -1003,6 +1002,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         xsizelst=[]
         ysizelst=[]
         formatlst=[]
+        stackable = False
 
         for item in filelist:
             ds = gdal.Open(item)
@@ -1039,10 +1039,9 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             result_format = False
 
         if result_proj and result_gt and result_dtype and result_xsize and result_ysize and result_format:
+            stackable = True
 
-            return True
-        else:
-            return False
+        return stackable
 
 
     def pack_zipfile(self, zipfilename, output_dir, variables=None):
