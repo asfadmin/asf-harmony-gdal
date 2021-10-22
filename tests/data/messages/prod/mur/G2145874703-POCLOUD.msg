@@ -3,9 +3,10 @@
     "callback": "http://172.17.0.1:3001/service/1330e84b-8959-4291-87ef-315366855359",
     "client": "harmony-local",
     "format": {
+        "isTransparent": true,
         "mime": "image/png",
-        "width": "36000",
-        "height": "17999"
+        "width": 40960,
+        "height": 20480
     },
     "isSynchronous": true,
     "requestId": "1330e84b-beef-4291-87ef-315366855359",

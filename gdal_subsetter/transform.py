@@ -107,9 +107,7 @@ class HarmonyAdapter(BaseHarmonyAdapter):
     def rename_file(self, input_filename, href):
         output_filename = "{dirname}/{basename}".format(dirname=os.path.dirname(input_filename),
         basename=generate_output_filename(href))
-        command=['mv']
-        command.extend([input_filename, output_filename])
-        self.cmd(*command)
+        os.rename(input_filename, output_filename)
         return output_filename
 
     def process_item(self, item, source):
@@ -666,11 +664,17 @@ class HarmonyAdapter(BaseHarmonyAdapter):
 
         # Use hard coded colormaps that match layerid
         colormaps_dir = os.path.dirname(os.path.realpath(__file__)) + '/colormaps/'
-        if 'ECCO' in layerid:
+        if 'ECCO' in srcfile:
             colormap = colormaps_dir + 'MedspirationIndexed.txt'
             discrete = True
-        elif 'MUR' in layerid:
-            colormap = colormaps_dir + 'SST.txt'
+        elif 'analysed_sst' in srcfile:
+            colormap = colormaps_dir + 'GHRSST_Sea_Surface_Temperature.txt'
+            discrete = True
+        elif 'sst_anomaly' in srcfile:
+            colormap = colormaps_dir + 'GHRSST_Sea_Surface_Temperature_Anomalies.txt'
+            discrete = True
+        elif 'sea_ice_fraction' in srcfile:
+            colormap = colormaps_dir + 'GHRSST_Sea_Ice_Concentration.txt'
             discrete = True
         else:
             colormap = colormaps_dir + 'Gray.txt'
@@ -811,9 +815,10 @@ class HarmonyAdapter(BaseHarmonyAdapter):
     def reformat(self, srcfile, dstdir):
         gdal_subsetter_version = "gdal_subsetter_version={gdal_subsetter_ver}".format(
             gdal_subsetter_ver=self.get_version())
-        command = ['gdal_edit.py',  '-mo', gdal_subsetter_version, srcfile]
-        self.cmd(*command)
         output_mime = self.message.format.process('mime')
+        if not output_mime == "image/png" or output_mime == "image/jpeg":
+            command = ['gdal_edit.py',  '-mo', gdal_subsetter_version, srcfile]
+            self.cmd(*command)
         if output_mime not in mime_to_gdal:
             raise Exception('Unrecognized output format: ' + output_mime)
         if output_mime == "image/tiff":
@@ -950,7 +955,17 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         input:raster file name
         output:bbox of the raster file
         """
-        ds = gdal.Open(filename, gdal.GA_Update)
+        output_mime = self.message.format.process('mime')
+        if output_mime == "image/png" or output_mime == "image/jpeg":
+            # PNG and JPEGs don't support update and assumes WGS84
+            ds = gdal.Open(filename, gdal.GA_ReadOnly)
+            ct2 = pyproj.Proj('+proj=longlat +datum=WGS84 +no_defs')
+        else:
+            ds = gdal.Open(filename, gdal.GA_Update)
+            projection = ds.GetProjection()
+            dst = osr.SpatialReference(projection)
+            dstproj4 = dst.ExportToProj4()
+            ct2 = pyproj.Proj(dstproj4)
         gt = ds.GetGeoTransform()
         cols = ds.RasterXSize
         rows = ds.RasterYSize
@@ -958,10 +973,6 @@ class HarmonyAdapter(BaseHarmonyAdapter):
         ur_x, ur_y = self.calc_ij_coord(gt, cols, 0)
         lr_x, lr_y = self.calc_ij_coord(gt, cols, rows)
         ll_x, ll_y = self.calc_ij_coord(gt, 0, rows)
-        projection = ds.GetProjection()
-        dst = osr.SpatialReference(projection)
-        dstproj4 = dst.ExportToProj4()
-        ct2 = pyproj.Proj(dstproj4)
         ul_x2, ul_y2 = ct2(ul_x, ul_y, inverse=True)
         ur_x2, ur_y2 = ct2(ur_x, ur_y, inverse=True)
         lr_x2, lr_y2 = ct2(lr_x, lr_y, inverse=True)
