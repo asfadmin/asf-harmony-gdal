@@ -28,7 +28,6 @@ def output_dir():
 
 @pytest.fixture()
 def message_files():
-
     message_path = './data/messages/prod'
 
     return list(Path(message_path).rglob("*.msg"))
@@ -49,13 +48,31 @@ def adapters(message_files):
 
 @unittest.mock.patch('harmony.aws.stage')
 def test_message(stage, adapters, output_dir):
-
     # Instead of staging to aws, just return the local filename
     stage.side_effect = lambda config, local_filename, remote_filename, mime, logger, location=None: local_filename
 
     for unittest_adapter in adapters:
         subsetter(unittest_adapter)
         subset_result(unittest_adapter, output_dir)
+
+
+@unittest.mock.patch('harmony.aws.stage')
+def test_world_file_in_output(stage, output_dir):
+    # Instead of staging to aws, just return the local filename
+    stage.side_effect = lambda config, local_filename, remote_filename, mime, logger, location=None: local_filename
+
+    adapter = UnittestAdapterNoDownload(open('./data/messages/prod/mur/G2145874703-POCLOUD.msg').read().rstrip())
+
+    result = subsetter(adapter)
+
+    for _, asset in result.assets.items():
+        stage.assert_called_with(unittest.mock.ANY, asset.href, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY,
+                                 unittest.mock.ANY)
+
+    assert len(result.assets) == 2
+    metadata_assets = [a for a in result.assets if 'metadata' in a.roles]
+    assert len(metadata_assets) == 1
+    assert metadata_assets[0].href.endswith('.wld')
 
 
 def subsetter(unittest_adapter):
@@ -78,6 +95,8 @@ def subsetter(unittest_adapter):
     if result:
         unittest_adapter.subsetted_file = result.assets['data'].href
         unittest_adapter.subsetted_success = True
+
+    return result
 
 
 def subset_result(unittest_adapter, output_dir):
