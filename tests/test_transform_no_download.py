@@ -65,14 +65,9 @@ def test_world_file_in_output(stage, output_dir):
 
     result = subsetter(adapter)
 
-    for _, asset in result.assets.items():
-        stage.assert_called_with(unittest.mock.ANY, asset.href, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY,
-                                 unittest.mock.ANY)
-
-    assert len(result.assets) == 2
-    metadata_assets = [a for a in result.assets if 'metadata' in a.roles]
-    assert len(metadata_assets) == 1
-    assert metadata_assets[0].href.endswith('.wld')
+    assert result.assets['data'].href.endswith('.png')
+    assert result.assets['metadata'].href.endswith('.wld')
+    assert 'metadata' in result.assets['metadata'].roles
 
 
 def subsetter(unittest_adapter):

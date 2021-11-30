@@ -212,9 +212,23 @@ class HarmonyAdapter(BaseHarmonyAdapter):
                     url, title=output_filename, media_type=mime, roles=['data']
                 )
 
+                # Include wld file if png or jpeg
+                if 'png' in mime or 'jpeg' in mime:
+                    world_filename = os.path.splitext(filename)[0] + '.wld'
+                    output_world_filename = os.path.splitext(output_filename)[0] + '.wld'
+                    world_url = stage(
+                        world_filename,
+                        output_world_filename,
+                        'text/plain',
+                        location=message.stagingLocation,
+                        logger=logger,
+                        cfg=self.config)
+                    stac_record.assets['metadata'] = Asset(
+                        world_url, title=output_world_filename, media_type='text/plain', roles=['metadata']
+                    )
                 return stac_record
             else:
-                logger.warn(process_msg)    
+                logger.warn(process_msg)
                 return None
 
         finally:
@@ -293,12 +307,6 @@ class HarmonyAdapter(BaseHarmonyAdapter):
                 layernames.append(layer_id)
 
                 filelist.append(filename)
-
-                # Include wld file if png or jpeg
-                if 'png' in self.message.format.mime:
-                    filelist.append(filename.replace('.png', '.wld'))
-                if 'jpeg' in self.message.format.mime:
-                    filelist.append(filename.replace('.jpeg', '.wld'))
 
         result = self.add_to_result(filelist, output_dir)
         
