@@ -842,14 +842,17 @@ class HarmonyAdapter(BaseHarmonyAdapter):
             dstfile = "%s/translated.%s" % (dstdir, "nc")
             dstfile = self.geotiff2netcdf_direct(srcfile, dstfile)
             return dstfile
-        else: #png, gif
+        else:  # png, jpeg, gif, etc.
+            if os.path.exists(os.path.splitext(srcfile)[0] + '.wld'):
+                # don't need to reformat files that have been processed earlier
+                return srcfile
             command = ['gdal_translate',
                        '-of', mime_to_gdal[output_mime],
                        '-scale',
                        srcfile, dstfile]
             self.cmd(*command)
             return dstfile
-        
+
 
     def read_layer_format(self, collection, filename, layer_id):
         gdalinfo_lines = self.cmd("gdalinfo", filename)
