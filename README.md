@@ -1,3 +1,5 @@
+:warning: This project is now maintained as the Harmony GDAL Adapter at https://github.com/nasa/harmony-gdal-adapter
+
 # harmony-gdal
 
 ![](https://data-services-github-badges.s3.amazonaws.com/cov.svg?dummy=true)
