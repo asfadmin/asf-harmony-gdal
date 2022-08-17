@@ -1,4 +1,4 @@
-:warning: The Harmony GDAL Adapter is now maintained at at https://github.com/nasa/harmony-gdal-adapter
+:warning: This project is now maintained as the Harmony GDAL Adapter at https://github.com/nasa/harmony-gdal-adapter
 
 # harmony-gdal
 
